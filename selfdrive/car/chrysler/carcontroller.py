@@ -1,8 +1,12 @@
+from cereal import car
 from opendbc.can.packer import CANPacker
+from openpilot.common.numpy_fast import clip
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.car import apply_meas_steer_torque_limits
 from openpilot.selfdrive.car.chrysler import chryslercan
 from openpilot.selfdrive.car.chrysler.values import RAM_CARS, CarControllerParams, ChryslerFlags
+
+LongCtrlState = car.CarControl.Actuators.LongControlState
 
 
 class CarController:
@@ -25,7 +29,7 @@ class CarController:
     lkas_active = CC.latActive and self.lkas_control_bit_prev
 
     # cruise buttons
-    if (self.frame - self.last_button_frame)*DT_CTRL > 0.05:
+    if not self.CP.openpilotLongitudinalControl and (self.frame - self.last_button_frame)*DT_CTRL > 0.05:
       das_bus = 2 if self.CP.carFingerprint in RAM_CARS else 0
 
       # ACC cancellation
@@ -44,6 +48,8 @@ class CarController:
         can_sends.append(chryslercan.create_lkas_hud(self.packer, self.CP, lkas_active, CC.hudControl.visualAlert,
                                                      self.hud_count, CS.lkas_car_model, CS.auto_high_beam))
         self.hud_count += 1
+        if self.CP.openpilotLongitudinalControl:
+          can_sends.append(chryslercan.create_acc_hud(self.packer, 4 if CC.longActive else 0, CC.hudControl.setSpeed))
 
     # steering
     if self.frame % self.params.STEER_STEP == 0:
@@ -74,6 +80,23 @@ class CarController:
       self.apply_steer_last = apply_steer
 
       can_sends.append(chryslercan.create_lkas_command(self.packer, self.CP, int(apply_steer), lkas_control_bit))
+
+    # longitudinal
+    if self.CP.openpilotLongitudinalControl and (self.frame % self.params.ACC_CONTROL_STEP) == 0:
+      long_active = CC.longActive
+      accel = clip(CC.actuators.accel, self.params.ACCEL_MIN, self.params.ACCEL_MAX)
+      starting = CC.actuators.longControlState == LongCtrlState.starting
+      stopping = CC.actuators.longControlState == LongCtrlState.stopping
+
+      gas = self.params.INACTIVE_GAS
+      brakes = self.params.INACTIVE_ACCEL
+      if long_active:
+        if accel > 0.05:
+          gas = clip(max(accel, 0) * 250, self.params.GAS_MIN, self.params.GAS_MAX)
+        if accel < 0.05:
+          brakes = min(accel, 0)
+
+      can_sends.extend(chryslercan.create_acc_commands(self.packer, long_active, gas, brakes, starting, stopping))
 
     self.frame += 1
 
